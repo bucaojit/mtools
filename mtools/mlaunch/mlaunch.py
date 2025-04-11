@@ -162,6 +162,8 @@ class MLaunchTool(BaseCmdLineTool):
     UNSUPPORTED_MONGOS_ARGS = ['--wiredTigerCacheSizeGB', '--storageEngine']
     UNSUPPORTED_CONFIG_ARGS = ['--oplogSize', '--storageEngine', '--smallfiles', '--nojournal']
 
+    _screen_command_available = None
+
     def __init__(self, test=False):
         BaseCmdLineTool.__init__(self)
 
@@ -1197,6 +1199,9 @@ class MLaunchTool(BaseCmdLineTool):
         # wait until all processes terminate
         psutil.wait_procs(procs)
 
+        # Wait for ports to be released on macOS with TLS
+        self._wait_for_ports_on_macos_tls()
+
         # start nodes again via start command
         self.start()
 
@@ -2123,8 +2128,7 @@ class MLaunchTool(BaseCmdLineTool):
                 "or greater"
             raise SystemExit(errmsg)
 
-        extra += self._get_ssl_server_args()
-        extra += self._get_tls_server_args()
+        extra, using_tls = self._process_tls_options(extra)
 
         path = self.args['binarypath'] or ''
         if os.name == 'nt':
@@ -2136,11 +2140,28 @@ class MLaunchTool(BaseCmdLineTool):
                                       rs_param, newdbpath, newlogpath, port,
                                       auth_param, extra))
         else:
-            command_str = ("\"%s\" %s --dbpath \"%s\" --logpath \"%s\" "
-                           "--port %i --fork "
-                           "%s %s" % (os.path.join(path, 'mongod'), rs_param,
-                                      dbpath, logpath, port, auth_param,
-                                      extra))
+            use_screen = False
+            if sys.platform == 'darwin' and using_tls:
+                screen_available = self._check_for_screen_command()
+                if screen_available:
+                    use_screen = True
+                else:
+                    print(
+                        "WARNING: TLS connections on macOS should use 'screen' instead of '--fork', but 'screen' is "
+                        "not available.")
+            if use_screen:
+                # For macOS with TLS using 'screen' if available
+                command_str = ("screen -dmS mongo_%i \"%s\" %s --dbpath \"%s\" --logpath \"%s\" "
+                               "--port %i %s %s" % (port, os.path.join(path, 'mongod'), rs_param,
+                                                    dbpath, logpath, port, auth_param,
+                                                    extra))
+            else:
+                # Standard command with --fork
+                command_str = ("\"%s\" %s --dbpath \"%s\" --logpath \"%s\" "
+                               "--port %i --fork "
+                               "%s %s" % (os.path.join(path, 'mongod'), rs_param,
+                                          dbpath, logpath, port, auth_param,
+                                          extra))
 
         # store parameters in startup_info
         self.startup_info[str(port)] = command_str
@@ -2160,8 +2181,7 @@ class MLaunchTool(BaseCmdLineTool):
             extra = self._filter_valid_arguments(self.unknown_args,
                                                  "mongos") + extra
 
-        extra += ' ' + self._get_ssl_server_args()
-        extra += ' ' + self._get_tls_server_args()
+        extra, using_tls = self._process_tls_options(extra)
 
         path = self.args['binarypath'] or ''
         if os.name == 'nt':
@@ -2171,9 +2191,26 @@ class MLaunchTool(BaseCmdLineTool):
                                        newlogpath, port, configdb,
                                        auth_param, extra))
         else:
-            command_str = ("%s --logpath \"%s\" --port %i --configdb %s %s %s "
-                           "--fork" % (os.path.join(path, 'mongos'), logpath,
-                                       port, configdb, auth_param, extra))
+            use_screen = False
+            if sys.platform == 'darwin' and using_tls:
+                screen_available = self._check_for_screen_command()
+                if screen_available:
+                    use_screen = True
+                else:
+                    print(
+                        "WARNING: TLS connections on macOS should use 'screen' instead of '--fork', but 'screen' is "
+                        "not available.")
+
+            if use_screen:
+                # For macOS with TLS using 'screen' if available
+                command_str = ("screen -dmS mongos_%i %s --logpath \"%s\" --port %i --configdb %s %s %s"
+                               % (port, os.path.join(path, 'mongos'), logpath,
+                                  port, configdb, auth_param, extra))
+            else:
+                # Standard command with --fork
+                command_str = ("%s --logpath \"%s\" --port %i --configdb %s %s %s "
+                               "--fork" % (os.path.join(path, 'mongos'), logpath,
+                                           port, configdb, auth_param, extra))
 
         # store parameters in startup_info
         self.startup_info[str(port)] = command_str
@@ -2185,6 +2222,85 @@ class MLaunchTool(BaseCmdLineTool):
         else:
             with open(keyfile, 'rb') as f:
                 return ''.join(f.readlines())
+
+    def _process_tls_options(self, extra=''):
+        """
+        Appends SSL/TLS server arguments to the extra string and determines if TLS is used.
+        """
+        ssl_args = self._get_ssl_server_args()
+        tls_args = self._get_tls_server_args()
+        updated_extra = extra
+
+        if ssl_args:
+            updated_extra += ' ' + ssl_args.strip()
+        if tls_args:
+            updated_extra += ' ' + tls_args.strip()
+        using_tls = bool(ssl_args.strip() or tls_args.strip())
+
+        return updated_extra, using_tls
+
+    def _wait_for_ports_on_macos_tls(self):
+        """
+        On macOS with TLS enabled, wait for ports to be released.  This helps address an
+        issue where if we try to start a new screen session too quickly, it will fail to
+        start, even though the previous sessions have been terminated.
+        """
+        if self.args['verbose']:
+            print("Performing additional port check for macOS with TLS...")
+
+        all_ports = self.get_tagged(['all'])
+        for attempt in range(20):
+            busy_ports = []
+            for port in all_ports:
+                try:
+                    result = subprocess.run(f"lsof -i:{port}",
+                                            shell=True,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE)
+                    is_free = result.returncode != 0
+                    if not is_free:
+                        busy_ports.append(port)
+                except Exception as e:
+                    if self.args['verbose']:
+                        print(f"Error checking port {port}: {e}")
+                    busy_ports.append(port)
+
+            if not busy_ports:
+                if self.args['verbose']:
+                    print(f"All ports free after {attempt + 1} seconds")
+                break
+            if self.args['verbose'] and attempt % 3 == 0:
+                print(f"Waiting for ports to be released: {busy_ports}")
+            time.sleep(1)
+
+    def _check_for_screen_command(self):
+        """
+        Checks if the 'screen' command is available to run on system.
+        Caches the result. Prints a warning if screen is not found.
+        """
+        if self._screen_command_available is not None:
+            return self._screen_command_available
+
+        if self.args and self.args.get('verbose'):
+            print("DEBUG: Performing check for 'screen' command...")
+
+        try:
+            subprocess.check_call(['command', '-v', 'screen'],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  shell=False)
+            if self.args and self.args.get('verbose'):
+                print("INFO: 'screen' command found.")
+            self._screen_command_available = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("WARNING: 'screen' command not found. This is required to run TLS-enabled processes "
+                  "in the background on macos.", file=sys.stderr)
+            self._screen_command_available = False
+        except Exception as e:
+            print(f"WARNING: Error checking for screen command: {e}", file=sys.stderr)
+            self._screen_command_available = False
+
+        return self._screen_command_available
 
 def main():
     tool = MLaunchTool()
